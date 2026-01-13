@@ -1,19 +1,19 @@
+import argparse
 import json
 import os
+import re
 import warnings
-from typing import List, Dict, Optional
-import argparse
+from typing import Dict, List, Optional
 
-import faiss
-import torch
-import numpy as np
-from transformers import AutoConfig, AutoTokenizer, AutoModel
-from tqdm import tqdm
 import datasets
-
+import faiss
+import numpy as np
+import torch
 import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
+from transformers import AutoConfig, AutoModel, AutoTokenizer
+from tqdm import tqdm
 
 
 parser = argparse.ArgumentParser(description="Launch the local faiss retriever.")
@@ -23,6 +23,8 @@ parser.add_argument("--topk", type=int, default=3, help="Number of retrieved pas
 parser.add_argument("--retriever_model", type=str, default="intfloat/e5-base-v2", help="Name of the retriever model.")
 
 args = parser.parse_args()
+
+MAX_SUMMARY_LENGTH = 512
 
 def load_corpus(corpus_path: str):
     corpus = datasets.load_dataset(
@@ -43,6 +45,37 @@ def read_jsonl(file_path):
 def load_docs(corpus, doc_idxs):
     results = [corpus[int(idx)] for idx in doc_idxs]
     return results
+
+
+def truncate_text(text: str, max_length: int = MAX_SUMMARY_LENGTH) -> str:
+    return text[:max_length] if text else text
+
+
+def simple_summary(text: str, max_length: int = MAX_SUMMARY_LENGTH) -> str:
+    """
+    Generate a lightweight summary by keeping the first couple of sentences
+    from a truncated snippet to avoid new dependencies.
+    """
+    if not text:
+        return ""
+    truncated = truncate_text(text, max_length)
+    sentences = re.split(r'(?<=[.!?。！？])\s+', truncated)
+    summary = ' '.join([s.strip() for s in sentences if s.strip()][:2])
+    return summary if summary else truncated
+
+
+def prepare_document_with_summary(document: Dict) -> Dict:
+    """
+    Ensure the document includes a truncated contents field and a lightweight summary.
+    """
+    processed_doc = dict(document)
+    contents = processed_doc.get('contents') or processed_doc.get('text', '')
+    truncated_contents = truncate_text(contents)
+    if contents:
+        processed_doc['contents'] = truncated_contents
+    summary_source = truncated_contents if contents else truncate_text(processed_doc.get('text', ''), MAX_SUMMARY_LENGTH)
+    processed_doc['summary'] = simple_summary(summary_source)
+    return processed_doc
 
 def load_model(model_path: str, use_fp16: bool = False):
     model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
@@ -196,6 +229,8 @@ class BM25Retriever(BaseRetriever):
         else:
             results = load_docs(self.corpus, [hit.docid for hit in hits])
 
+        results = [prepare_document_with_summary(doc) for doc in results]
+
         if return_score:
             return results, scores
         else:
@@ -241,7 +276,7 @@ class DenseRetriever(BaseRetriever):
         scores, idxs = self.index.search(query_emb, k=num)
         idxs = idxs[0]
         scores = scores[0]
-        results = load_docs(self.corpus, idxs)
+        results = [prepare_document_with_summary(doc) for doc in load_docs(self.corpus, idxs)]
         if return_score:
             return results, scores.tolist()
         else:
@@ -264,7 +299,7 @@ class DenseRetriever(BaseRetriever):
 
             # load_docs is not vectorized, but is a python list approach
             flat_idxs = sum(batch_idxs, [])
-            batch_results = load_docs(self.corpus, flat_idxs)
+            batch_results = [prepare_document_with_summary(doc) for doc in load_docs(self.corpus, flat_idxs)]
             # chunk them back
             batch_results = [batch_results[i*num : (i+1)*num] for i in range(len(batch_idxs))]
             

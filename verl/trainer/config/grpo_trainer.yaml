@@ -147,6 +147,9 @@ reward_model:
   use_dynamic_bsz: ${critic.use_dynamic_bsz}
   reward_style: EM
   forward_max_token_len_per_gpu: ${critic.forward_max_token_len_per_gpu}
+  retrieval_doc_bonus: 0.1
+  search_step_bonus_weight: 0.1
+  format_bonus: 0.1
 
 retriever:
   url: "http://127.0.0.1:8000/retrieve"

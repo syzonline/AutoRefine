@@ -457,13 +457,33 @@ If I want to give the final answer, I should put the answer between <answer> and
         
         return requests.post(self.config.search_url, json=payload).json()
 
+    @staticmethod
+    def _truncate_text(text: str, max_length: int = 512) -> str:
+        return text[:max_length] if text else text
+
+    @staticmethod
+    def _generate_summary(text: str, max_length: int = 512) -> str:
+        if not text:
+            return ""
+        truncated = LLMGenerationManager._truncate_text(text, max_length)
+        sentences = re.split(r'(?<=[.!?。！？])\s+', truncated)
+        summary = ' '.join([s.strip() for s in sentences if s.strip()][:2])
+        return summary if summary else truncated
+
     def _passages2string(self, retrieval_result):
         format_reference = ''
         for idx, doc_item in enumerate(retrieval_result):
             
-            content = doc_item['document']['contents']
-            title = content.split("\n")[0]
-            text = "\n".join(content.split("\n")[1:])
-            format_reference += f"Doc {idx+1}(Title: {title}) {text}\n"
+            document = doc_item.get('document', doc_item) if isinstance(doc_item, dict) else {}
+            contents = document.get('contents') or document.get('text', '')
+            title = document.get('title')
+            if not title and contents:
+                title = contents.split("\n")[0]
+            summary_or_text = document.get('summary')
+            if not summary_or_text:
+                summary_or_text = self._generate_summary(contents)
+            summary_or_text = self._truncate_text(summary_or_text, 512)
+            title = title if title else "N/A"
+            format_reference += f"Doc {idx+1}(Title: {title}) {summary_or_text}\n"
 
         return format_reference

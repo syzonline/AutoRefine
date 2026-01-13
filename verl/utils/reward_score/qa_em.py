@@ -156,9 +156,71 @@ def extract_solution(responses_str):
     # If there are 2 or more matches, return the last one
     return matches[-1].group(1).strip()
 
+
+def extract_documents(sequences_str):
+    info_pattern = r'<documents>(.*?)</documents>'
+    return re.findall(info_pattern, sequences_str, re.DOTALL)
+
+
+def contains_ground_truth_in_documents(sequences_str, ground_truth):
+    documents = extract_documents(sequences_str)
+    if not documents:
+        return 0
+    targets = ground_truth.get('target', [])
+    if isinstance(targets, str):
+        targets = [targets]
+    normalized_docs = [normalize_answer(doc) for doc in documents if doc]
+    for target in targets:
+        if not target:
+            continue
+        target_norm = normalize_answer(target)
+        target_raw = target.lower()
+        for doc, doc_norm in zip(documents, normalized_docs):
+            if target_raw in doc.lower() or (target_norm and target_norm in doc_norm):
+                return 1
+    return 0
+
 def compute_score_format(responses_str, ground_truth):
-    format_validity = validate_format(responses_str, responses_str)
+    format_validity = is_format_correct(responses_str, responses_str)
     return format_validity
+
+
+def is_format_correct(prompt_str, response_str):
+    if not response_str:
+        return 0
+    token_list = ['think', 'search', 'answer']
+    if '<refine>' in prompt_str:
+        token_list.insert(2, 'refine')
+    for special_tag in token_list:
+        start_token = f"<{special_tag}>"
+        end_token = f"</{special_tag}>"
+        start_count = response_str.count(start_token)
+        end_count = response_str.count(end_token)
+        if start_count != end_count or start_count == 0:
+            return 0
+    ends_with_answer = response_str.strip().endswith("</answer>")
+    return 1 if ends_with_answer else 0
+
+
+def compute_format_bonus(prompt_str, response_str, bonus=0.1):
+    if is_format_correct(prompt_str, response_str):
+        return bonus
+    return 0.0
+
+
+def compute_doc_hit_bonus(sequences_str, ground_truth, bonus=0.1):
+    if contains_ground_truth_in_documents(sequences_str, ground_truth):
+        return bonus
+    return 0.0
+
+
+def compute_search_step_bonus(responses_str, ground_truth, search_steps, bonus_weight=0.1):
+    if search_steps is None:
+        return 0.0
+    answer_correct = compute_score_em(responses_str=responses_str, ground_truth=ground_truth) > 0
+    if not answer_correct:
+        return 0.0
+    return bonus_weight / (1.0 + float(search_steps))
 
 def compute_reward(solution_str, responses_str, ground_truth, format_score=0., score=1., refine_score=0.0, do_print_frac=-1, score_func=em_check):
     answer = extract_solution(responses_str)

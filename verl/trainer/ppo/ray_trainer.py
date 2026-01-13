@@ -86,7 +86,7 @@ class ResourcePoolManager:
 
 
 import torch
-from verl.utils.torch_functional import masked_mean
+from verl.utils.torch_functional import masked_mean, masked_whiten
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty='kl'):
@@ -150,6 +150,36 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                                                                         index=index)
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
+    elif adv_estimator == 'gdpo':
+        responses = data.batch['responses']
+        response_length = responses.size(-1)
+        attention_mask = data.batch['attention_mask']
+        response_mask = attention_mask[:, -response_length:]
+        index = data.non_tensor_batch['uid']
+
+        reward_keys = data.meta_info.get('gdpo_reward_keys')
+        if not reward_keys:
+            reward_keys = sorted(
+                key for key in data.batch.keys()
+                if key.startswith('token_level_scores_') and key != 'token_level_scores'
+            )
+        if not reward_keys:
+            raise ValueError('GDPO requires token_level_scores_* rewards to be present.')
+
+        normalized_scores = []
+        for key in reward_keys:
+            token_level_scores = data.batch[key]
+            normalized_score, _ = core_algos.compute_grpo_outcome_advantage(
+                token_level_rewards=token_level_scores,
+                eos_mask=response_mask,
+                index=index,
+            )
+            normalized_scores.append(normalized_score)
+
+        combined_score = torch.stack(normalized_scores, dim=0).sum(dim=0)
+        advantages = masked_whiten(combined_score, response_mask) * response_mask
+        data.batch['advantages'] = advantages
+        data.batch['returns'] = advantages
     else:
         raise NotImplementedError
     return data
@@ -223,6 +253,10 @@ def compute_data_metrics(batch, use_critic=True):
         'critic/answer_cem': batch.batch['answer_cem'],
         'critic/refine_scores': batch.batch['refine_scores'],
         'critic/format_scores': batch.batch['format_scores'],
+        'critic/doc_ground_truth_hit': batch.batch.get('doc_ground_truth_hit'),
+        'critic/search_steps': batch.batch.get('search_steps'),
+        'critic/format_bonus': batch.batch.get('format_bonus'),
+        'critic/search_step_bonus': batch.batch.get('search_step_bonus'),
         'response_length': response_length,
         'prompt_length': prompt_length,
     }.items():
@@ -916,9 +950,11 @@ class RayPPOTrainer(object):
                         # we combine with rule-based rm
                         reward_tensor = self.reward_fn(batch)
                         refine_reward_tensor = self.reward_fn.get_refine_subem(batch)
+                        reward_components = self.reward_fn.get_reward_components(batch)
                         batch.batch.update(self.reward_fn.get_logging_scores(batch, self.global_steps))
                         batch.batch['token_level_scores'] = reward_tensor
                         batch.batch['token_level_refine_scores'] = refine_reward_tensor
+                        batch.batch.update(reward_components)
 
                         if self.config.actor_rollout_ref.actor.refine_lambda > 0:
                             reward_tensor += self.config.actor_rollout_ref.actor.refine_lambda * refine_reward_tensor

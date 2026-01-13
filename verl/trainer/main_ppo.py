@@ -40,35 +40,107 @@ class RewardManager():
     """The reward manager.
     """
 
-    def __init__(self, tokenizer, num_examine, format_score=0., refine_score=0., reward_style='EM', log_path=None) -> None:
+    def __init__(
+        self,
+        tokenizer,
+        num_examine,
+        format_score=0.,
+        format_bonus=0.1,
+        refine_score=0.,
+        reward_style='EM',
+        log_path=None,
+        retrieval_doc_bonus=0.1,
+        search_step_bonus_weight=0.1,
+    ) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.format_score = format_score
+        self.format_bonus = format_bonus
         self.refine_score = refine_score
         self.log_path = log_path
         self.reward_style = reward_style
+        self.retrieval_doc_bonus = retrieval_doc_bonus
+        self.search_step_bonus_weight = search_step_bonus_weight
+
+    def _decode_item(self, data_item):
+        prompt_ids = data_item.batch['prompts']
+        prompt_length = prompt_ids.shape[-1]
+        valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
+        valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+
+        response_ids = data_item.batch['responses']
+        valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
+        valid_response_ids = response_ids[:valid_response_length]
+
+        sequences = torch.cat((valid_prompt_ids, valid_response_ids))
+        sequences_str = self.tokenizer.decode(sequences)
+        responses_str = self.tokenizer.decode(valid_response_ids)
+        return sequences_str, responses_str, valid_response_length
+
+    def get_reward_components(self, data: DataProto):
+        components = {
+            'token_level_scores_correctness': torch.zeros_like(data.batch['responses'], dtype=torch.float32),
+            'token_level_scores_format': torch.zeros_like(data.batch['responses'], dtype=torch.float32),
+            'token_level_scores_doc_hit': torch.zeros_like(data.batch['responses'], dtype=torch.float32),
+            'token_level_scores_search_step': torch.zeros_like(data.batch['responses'], dtype=torch.float32),
+        }
+        for i in range(len(data)):
+            data_item = data[i]
+            sequences_str, responses_str, valid_response_length = self._decode_item(data_item)
+            ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
+
+            if self.reward_style.lower() == 'em':
+                compute_score_fn = qa_em.em_check
+            elif self.reward_style.lower() == 'f1':
+                compute_score_fn = qa_em.compute_f1_scores
+            elif self.reward_style.lower() == 'cem':
+                compute_score_fn = qa_em.cover_em_check
+            else:
+                raise NotImplementedError
+
+            correctness_score = qa_em.compute_reward(
+                solution_str=sequences_str,
+                responses_str=responses_str,
+                ground_truth=ground_truth,
+                score_func=compute_score_fn,
+                format_score=self.format_score,
+                refine_score=self.refine_score,
+                do_print_frac=-1,
+            )
+            format_bonus = qa_em.compute_format_bonus(
+                prompt_str=sequences_str,
+                response_str=responses_str,
+                bonus=self.format_bonus,
+            )
+            doc_bonus = qa_em.compute_doc_hit_bonus(
+                sequences_str=sequences_str,
+                ground_truth=ground_truth,
+                bonus=self.retrieval_doc_bonus,
+            )
+            search_steps = None
+            if 'valid_search_stats' in data.meta_info:
+                search_steps = data.meta_info['valid_search_stats'][i]
+            search_bonus = qa_em.compute_search_step_bonus(
+                responses_str=responses_str,
+                ground_truth=ground_truth,
+                search_steps=search_steps,
+                bonus_weight=self.search_step_bonus_weight,
+            )
+
+            components['token_level_scores_correctness'][i, valid_response_length - 1] = correctness_score
+            components['token_level_scores_format'][i, valid_response_length - 1] = format_bonus
+            components['token_level_scores_doc_hit'][i, valid_response_length - 1] = doc_bonus
+            components['token_level_scores_search_step'][i, valid_response_length - 1] = search_bonus
+
+        data.meta_info['gdpo_reward_keys'] = list(components.keys())
+        return components
 
     def get_refine_subem(self, data: DataProto):
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
 
         for i in range(len(data)):
             data_item = data[i]  # DataProtoItem
-
-            prompt_ids = data_item.batch['prompts']
-
-            prompt_length = prompt_ids.shape[-1]
-
-            valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
-            valid_prompt_ids = prompt_ids[-valid_prompt_length:]
-
-            response_ids = data_item.batch['responses']
-            valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
-            valid_response_ids = response_ids[:valid_response_length]
-
-            # decode
-            sequences = torch.cat((valid_prompt_ids, valid_response_ids))
-            sequences_str = self.tokenizer.decode(sequences)
-            responses_str = self.tokenizer.decode(valid_response_ids)
+            sequences_str, responses_str, valid_response_length = self._decode_item(data_item)
 
             ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
 
@@ -83,28 +155,40 @@ class RewardManager():
 
         for i in range(len(data)):
             data_item = data[i]  # DataProtoItem
-
-            prompt_ids = data_item.batch['prompts']
-
-            prompt_length = prompt_ids.shape[-1]
-
-            valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
-            valid_prompt_ids = prompt_ids[-valid_prompt_length:]
-
-            response_ids = data_item.batch['responses']
-            valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
-            valid_response_ids = response_ids[:valid_response_length]
-
-            # decode
-            sequences = torch.cat((valid_prompt_ids, valid_response_ids))
-            sequences_str = self.tokenizer.decode(sequences)
-            responses_str = self.tokenizer.decode(valid_response_ids)
+            sequences_str, responses_str, _ = self._decode_item(data_item)
 
             ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
 
             for key, compute_fn in LOG_FUNCS.items():
                 score = compute_fn(responses_str=responses_str, ground_truth=ground_truth)
                 additional_scores[key][i] = score
+
+            doc_hit_score = qa_em.contains_ground_truth_in_documents(
+                sequences_str=sequences_str,
+                ground_truth=ground_truth,
+            )
+            additional_scores['doc_ground_truth_hit'][i] = doc_hit_score
+
+            format_bonus = qa_em.compute_format_bonus(
+                prompt_str=sequences_str,
+                response_str=responses_str,
+                bonus=self.format_bonus,
+            )
+            additional_scores['format_bonus'][i] = format_bonus
+
+            search_steps = None
+            if 'valid_search_stats' in data.meta_info:
+                search_steps = data.meta_info['valid_search_stats'][i]
+                additional_scores['search_steps'][i] = float(search_steps)
+            else:
+                additional_scores['search_steps'][i] = 0.0
+            search_step_bonus = qa_em.compute_search_step_bonus(
+                responses_str=responses_str,
+                ground_truth=ground_truth,
+                search_steps=search_steps,
+                bonus_weight=self.search_step_bonus_weight,
+            )
+            additional_scores['search_step_bonus'][i] = search_step_bonus
             
             scores_item = {key: additional_scores[key][i].item() for key in additional_scores.keys()}
 
@@ -143,22 +227,7 @@ class RewardManager():
 
         for i in range(len(data)):
             data_item = data[i]  # DataProtoItem
-
-            prompt_ids = data_item.batch['prompts']
-
-            prompt_length = prompt_ids.shape[-1]
-
-            valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
-            valid_prompt_ids = prompt_ids[-valid_prompt_length:]
-
-            response_ids = data_item.batch['responses']
-            valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
-            valid_response_ids = response_ids[:valid_response_length]
-
-            # decode
-            sequences = torch.cat((valid_prompt_ids, valid_response_ids))
-            sequences_str = self.tokenizer.decode(sequences)
-            responses_str = self.tokenizer.decode(valid_response_ids)
+            sequences_str, responses_str, valid_response_length = self._decode_item(data_item)
 
             ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
 
@@ -171,7 +240,37 @@ class RewardManager():
                 compute_score_fn = qa_em.cover_em_check
             else:
                 raise NotImplementedError
-            score = qa_em.compute_reward(solution_str=sequences_str, responses_str=responses_str, ground_truth=ground_truth, score_func=compute_score_fn, format_score=self.format_score, refine_score=self.refine_score, do_print_frac=1024)
+            score = qa_em.compute_reward(
+                solution_str=sequences_str,
+                responses_str=responses_str,
+                ground_truth=ground_truth,
+                score_func=compute_score_fn,
+                format_score=self.format_score,
+                refine_score=self.refine_score,
+                do_print_frac=1024,
+            )
+
+            doc_hit_bonus = qa_em.compute_doc_hit_bonus(
+                sequences_str=sequences_str,
+                ground_truth=ground_truth,
+                bonus=self.retrieval_doc_bonus,
+            )
+            score += doc_hit_bonus
+
+            search_steps = None
+            if 'valid_search_stats' in data.meta_info:
+                search_steps = data.meta_info['valid_search_stats'][i]
+            score += qa_em.compute_search_step_bonus(
+                responses_str=responses_str,
+                ground_truth=ground_truth,
+                search_steps=search_steps,
+                bonus_weight=self.search_step_bonus_weight,
+            )
+            score += qa_em.compute_format_bonus(
+                prompt_str=sequences_str,
+                response_str=responses_str,
+                bonus=self.format_bonus,
+            )
 
             reward_tensor[i, valid_response_length - 1] = score
 
@@ -265,11 +364,32 @@ def main_task(config):
     refine_score = config.actor_rollout_ref.actor.refine_score
     format_score = config.actor_rollout_ref.actor.format_score
     reward_style = config.reward_model.reward_style
-    reward_fn = RewardManager(tokenizer=tokenizer, num_examine=config.reward_model.train_num_examine, log_path=train_log_jsonl, format_score=format_score, refine_score=refine_score, reward_style=reward_style)
+    retrieval_doc_bonus = getattr(config.reward_model, "retrieval_doc_bonus", 0.1)
+    search_step_bonus_weight = getattr(config.reward_model, "search_step_bonus_weight", 0.1)
+    format_bonus = getattr(config.reward_model, "format_bonus", 0.1)
+    reward_fn = RewardManager(
+        tokenizer=tokenizer,
+        num_examine=config.reward_model.train_num_examine,
+        log_path=train_log_jsonl,
+        format_score=format_score,
+        format_bonus=format_bonus,
+        refine_score=refine_score,
+        reward_style=reward_style,
+        retrieval_doc_bonus=retrieval_doc_bonus,
+        search_step_bonus_weight=search_step_bonus_weight,
+    )
 
     # Note that we always use function-based RM for validation
     val_log_jsonl = f'log/val/{config.trainer.experiment_name}.jsonl'
-    val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=config.reward_model.val_num_examine, log_path=val_log_jsonl, reward_style=reward_style)
+    val_reward_fn = RewardManager(
+        tokenizer=tokenizer,
+        num_examine=config.reward_model.val_num_examine,
+        log_path=val_log_jsonl,
+        reward_style=reward_style,
+        format_bonus=format_bonus,
+        retrieval_doc_bonus=retrieval_doc_bonus,
+        search_step_bonus_weight=search_step_bonus_weight,
+    )
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
     if config.algorithm.filter_groups.enable:
